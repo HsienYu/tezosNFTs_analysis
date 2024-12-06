@@ -6,5 +6,6 @@ export default defineConfig({
   build: {
     outDir: 'public/build',
     emptyOutDir: true
-  }
+  },
+  publicDir: 'static' // Change this to a different folder
 });

@@ -335,6 +335,13 @@
   $: rankedCollectors = Array.from(collectors.values()).sort(
     (a, b) => b.totalBalance - a.totalBalance
   ); // Removed .slice(0, 20)
+
+  function handleKeyDown(event, collector) {
+    if (event.key === "Enter" || event.key === " ") {
+      // Handle the click event
+      selectCollector(collector);
+    }
+  }
 </script>
 
 <div class="analysis-container">
@@ -369,7 +376,10 @@
             <div
               class="ranking-row"
               class:selected={selectedCollector?.address === collector.address}
+              role="button"
+              tabindex="0"
               on:click={() => selectCollector(collector)}
+              on:keydown={(event) => handleKeyDown(event, collector)}
               style="border-left: 4px solid {collector.color}"
             >
               <div class="rank">#{collector.rank}</div>
