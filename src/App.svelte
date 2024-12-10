@@ -4,9 +4,10 @@
   import TezosNFTChart from "./TezosNFTChart.svelte";
   import TezosNFTCollectors from "./TezosNFTCollectors.svelte";
   import TezosCollectorAnalysis from "./TezosCollectorAnalysis.svelte";
+  import Dashboard from "./Dashboard.svelte";
 
   /** @type {string} */
-  let selectedTab = "collectors"; // Change default tab
+  let selectedTab = "dashboard"; // Set default tab to dashboard
   let isLoading = false; // Don't start with loading state
   let sharedTokens = null;
   let sharedCategories = [];
@@ -100,6 +101,10 @@
         </div>
         <p>Loading content...</p>
       </div>
+    {:else if selectedTab === "dashboard"}
+      <div class="dashboard-wrapper">
+        <Dashboard />
+      </div>
     {:else if selectedTab === "collectors"}
       <TezosCollectorAnalysis
         preloadedTokens={sharedTokens}
@@ -113,8 +118,6 @@
       />
     {:else if selectedTab === "general"}
       <TezosNFTChart />
-    {:else if selectedTab === "dashboard"}
-      <h2>Dashboard Content Coming Soon</h2>
     {/if}
   </div>
 </main>
@@ -191,6 +194,7 @@
     margin: 2rem auto;
     padding: 0 2rem;
     width: 100%;
+    box-sizing: border-box;
   }
 
   .loading {
@@ -233,5 +237,12 @@
   .loading p {
     margin-top: 1rem;
     font-size: 0.9rem;
+  }
+
+  .dashboard-wrapper {
+    width: 100%;
+    min-height: 500px;
+    background: #f5f7fa;
+    padding: 1rem;
   }
 </style>
