@@ -32,6 +32,25 @@
   let chart3;
   let canvas3Element;
   let timeGranularity = "day"; // 'day', 'halfday', 'hour'
+  let chart4;
+  let canvas4Element;
+
+  // Add new state variables
+  let selectedSequenceLength = 0;
+  let availableSequenceLengths = [];
+  let sequenceStats = {
+    totalSequences: 0,
+    uniqueSequences: 0,
+    maxLength: 0,
+  };
+
+  // Add new state variables for sequence visualization
+  let selectedSequence = null;
+  let sequenceDetails = null;
+  let showSequenceDetails = false;
+
+  // Add new state variable
+  let showAllSequences = false;
 
   async function calculateTokenCollectionRate(token) {
     try {
@@ -229,6 +248,7 @@
       createChart();
       createDurationChart();
       createTimeSeriesChart();
+      createSequenceChart();
     } catch (error) {
       console.error("Error loading data:", error);
       loading = false;
@@ -544,11 +564,322 @@
     });
   }
 
-  $: if (!loading && (selectedLocation || timeGranularity)) {
+  function processCollectionPatterns(tokens) {
+    const locationTokens =
+      selectedLocation === "All Locations"
+        ? tokens
+        : tokens.filter((t) => t.location === selectedLocation);
+
+    // Create timeline of all claims with additional validation
+    const allClaims = [];
+    const claimRegistry = new Set(); // For duplicate detection
+
+    locationTokens.forEach((token) => {
+      if (!token.transfers) return;
+
+      // Enhanced filtering to exclude burned and invalid transfers
+      const claims = token.transfers
+        .filter((t) => {
+          // Exclude transfers that:
+          // 1. Aren't from AkaDrop
+          // 2. Are to excluded/burned addresses
+          // 3. Are part of burn transactions
+          return (
+            t.from.address === AkaDropAddress &&
+            ![BurnedAddress, ExcludedAddress].includes(t.to.address) &&
+            Number(t.amount) > 0
+          );
+        })
+        .map((transfer) => {
+          const claimKey = `${transfer.to.address}-${token.tokenId}-${transfer.timestamp}`;
+          if (claimRegistry.has(claimKey)) {
+            console.warn(`Duplicate claim detected: ${claimKey}`);
+            return null;
+          }
+          claimRegistry.add(claimKey);
+
+          const date = new Date(transfer.timestamp);
+          return {
+            tokenId: token.tokenId,
+            tokenName: token.name.replace(/Kairos NFT #/g, "#"),
+            timestamp: date.getTime(),
+            collector: transfer.to.address,
+            location: token.location,
+            formattedTime: date.toLocaleTimeString(),
+            formattedDate: date.toLocaleDateString(), // Add date
+          };
+        })
+        .filter((claim) => claim !== null);
+
+      allClaims.push(...claims);
+    });
+
+    // Validate and sort claims
+    allClaims.sort((a, b) => a.timestamp - b.timestamp);
+    console.log(`Processed ${allClaims.length} validated claims`);
+
+    // Group by collector with timing information
+    const collectorSequences = new Map();
+    allClaims.forEach((claim) => {
+      if (!collectorSequences.has(claim.collector)) {
+        collectorSequences.set(claim.collector, []);
+      }
+      const claims = collectorSequences.get(claim.collector);
+      const lastClaim = claims[claims.length - 1];
+
+      claim.timeSinceLast = lastClaim
+        ? (claim.timestamp - lastClaim.timestamp) / 1000 // in seconds
+        : 0;
+
+      claims.push(claim);
+    });
+
+    // Process sequences with timing
+    const sequences = new Map();
+    let maxLength = 0;
+
+    collectorSequences.forEach((claims, collector) => {
+      maxLength = Math.max(maxLength, claims.length);
+
+      // Generate sequences for different lengths
+      for (let len = 2; len <= claims.length; len++) {
+        const sequence = claims.slice(0, len).map((c, i) => ({
+          token: c.tokenName,
+          timeGap: c.timeSinceLast,
+          timestamp: c.timestamp,
+          formattedTime: c.formattedTime,
+          formattedDate: c.formattedDate, // Add date
+        }));
+
+        const key = len;
+        if (!sequences.has(key)) {
+          sequences.set(key, new Map());
+        }
+
+        const sequenceKey = JSON.stringify(sequence);
+        const count = sequences.get(key).get(sequenceKey) || 0;
+        sequences.get(key).set(sequenceKey, count + 1);
+      }
+    });
+
+    // Update UI state
+    availableSequenceLengths = Array.from(sequences.keys()).sort(
+      (a, b) => a - b
+    );
+    if (!availableSequenceLengths.includes(selectedSequenceLength)) {
+      selectedSequenceLength = availableSequenceLengths[0] || 0;
+    }
+
+    sequenceStats = {
+      totalSequences: allClaims.length,
+      uniqueSequences: sequences.get(selectedSequenceLength)?.size || 0,
+      maxLength,
+      uniqueCollectors: collectorSequences.size,
+    };
+
+    return sequences;
+  }
+
+  function createSequenceChart() {
+    if (!canvas4Element) return;
+    if (chart4) chart4.destroy();
+
+    const sequences = processCollectionPatterns(filteredTokens);
+    const currentSequences = sequences.get(selectedSequenceLength);
+    if (!currentSequences) return;
+
+    // Process sequences for visualization with improved validation
+    const sortedSequences = Array.from(currentSequences.entries())
+      .map(([seqStr, count]) => {
+        const sequence = JSON.parse(seqStr);
+        // Verify sequence data integrity
+        const isValidSequence = sequence.every(
+          (s) =>
+            s.token &&
+            typeof s.timeGap === "number" &&
+            s.timestamp &&
+            s.formattedTime
+        );
+        if (!isValidSequence) {
+          console.warn("Invalid sequence detected:", sequence);
+          return null;
+        }
+        return { sequence, count };
+      })
+      .filter((item) => item !== null)
+      .sort((a, b) => b.count - a.count)
+      // Modify slice based on showAllSequences
+      .slice(0, showAllSequences ? undefined : 20);
+
+    // Enhanced label formatting function
+    const getShortLabel = (sequence) => {
+      const tokens = sequence.map((s) => s.token);
+      if (tokens.length <= 2) return tokens.join(" → ");
+      if (tokens.length === 3)
+        return `${tokens[0]} → ${tokens[1]} → ${tokens[2]}`;
+      // For longer sequences, show first, count, and last
+      return `${tokens[0]} (+${tokens.length - 2}) ${tokens[tokens.length - 1]}`;
+    };
+
+    const ctx = canvas4Element.getContext("2d");
+    chart4 = new Chart(ctx, {
+      type: "bar",
+      data: {
+        labels: sortedSequences.map(({ sequence }) => getShortLabel(sequence)),
+        datasets: [
+          {
+            label: `${selectedSequenceLength}-Token Sequences`,
+            data: sortedSequences.map((s) => s.count),
+            backgroundColor: sortedSequences.map(
+              (_, i) => `hsl(${(i * 360) / sortedSequences.length}, 70%, 60%)`
+            ),
+            borderColor: "rgba(75, 192, 192, 1)",
+            borderWidth: 1,
+          },
+        ],
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        onClick: (event, elements, chart) => {
+          const rect = chart.canvas.getBoundingClientRect();
+          const mouseY = event.clientY - rect.top;
+
+          // First check for bar clicks
+          const points = chart.getElementsAtEventForMode(
+            event,
+            "nearest",
+            { intersect: true },
+            true
+          );
+
+          if (points.length > 0) {
+            const idx = points[0].index;
+            selectedSequence = sortedSequences[idx].sequence;
+            showSequenceDetails = true;
+            return;
+          }
+
+          // Then check for y-axis label clicks
+          const yAxis = chart.scales.y;
+          const ticks = yAxis.ticks;
+
+          for (let i = 0; i < ticks.length; i++) {
+            const tick = ticks[i];
+            const tickCenter = yAxis.getPixelForTick(i);
+
+            // Create a clickable area around the tick
+            if (Math.abs(mouseY - tickCenter) < 10) {
+              selectedSequence = sortedSequences[i].sequence;
+              showSequenceDetails = true;
+              break;
+            }
+          }
+        },
+        plugins: {
+          title: {
+            display: true,
+            text: [
+              `Top ${showAllSequences ? "All" : "20"} Collection Sequences (Length: ${selectedSequenceLength})`,
+              `${sequenceStats.uniqueSequences} unique patterns by ${sequenceStats.uniqueCollectors} collectors`,
+              "Click bar or label to view sequence details",
+            ],
+            padding: 20,
+          },
+          tooltip: {
+            callbacks: {
+              title: (context) => {
+                const sequence = sortedSequences[context[0].dataIndex].sequence;
+                return `Collection Sequence #${context[0].dataIndex + 1}`;
+              },
+              label: (context) => {
+                const sequence = sortedSequences[context.dataIndex].sequence;
+                const count = context.raw;
+                const percentage = (
+                  (count / sequenceStats.uniqueCollectors) *
+                  100
+                ).toFixed(1);
+                const totalTime =
+                  sequence.reduce((sum, s) => sum + (s.timeGap || 0), 0) / 60; // Convert to minutes
+
+                return [
+                  `${count} collectors (${percentage}% of total)`,
+                  `Total collection time: ${totalTime.toFixed(1)} minutes`,
+                  "",
+                  "Sequence pattern:",
+                  ...sequence.map((s, i) =>
+                    i === 0
+                      ? `Start: ${s.token} (${s.formattedTime})`
+                      : `  +${(s.timeGap / 60).toFixed(1)}min: ${s.token}`
+                  ),
+                ];
+              },
+            },
+            position: "nearest",
+            intersect: false,
+            backgroundColor: "rgba(0,0,0,0.85)",
+            titleFont: { size: 14, weight: "bold" },
+            bodyFont: { size: 12 },
+            padding: 12,
+            displayColors: false,
+          },
+          legend: {
+            display: false,
+          },
+        },
+        scales: {
+          x: {
+            title: {
+              display: true,
+              text: "Number of Collectors",
+              font: { weight: "bold" },
+            },
+            ticks: {
+              stepSize: 1,
+              precision: 0,
+            },
+            grid: {
+              display: true,
+              color: "rgba(0,0,0,0.1)",
+            },
+          },
+          y: {
+            ticks: {
+              callback: function (val) {
+                const label = this.getLabelForValue(val);
+                return label.replace(/Kairos NFT /g, "").replace(/[#]/g, "");
+              },
+              font: {
+                size: 11,
+                weight: 500,
+              },
+              color: "#0066cc",
+            },
+            grid: {
+              display: false,
+            },
+          },
+        },
+        animation: {
+          duration: 500,
+        },
+      },
+    });
+  }
+
+  $: if (
+    !loading &&
+    (selectedLocation ||
+      timeGranularity ||
+      selectedSequenceLength ||
+      showAllSequences)
+  ) {
     updateFilteredTokens();
     createChart();
     createDurationChart();
     createTimeSeriesChart();
+    createSequenceChart();
   }
 </script>
 
@@ -607,6 +938,60 @@
       <div class="canvas-container">
         <canvas bind:this={canvas3Element}></canvas>
       </div>
+    </div>
+    <div class="chart-section">
+      <h2>Token Collection Sequences</h2>
+      <h4>*Click bar to show sequence details*</h4>
+      <div class="controls">
+        <div class="sequence-controls">
+          <label>
+            Sequence Length:
+            <select bind:value={selectedSequenceLength}>
+              {#each availableSequenceLengths as length}
+                <option value={length}>{length} tokens</option>
+              {/each}
+            </select>
+          </label>
+          <label class="show-all">
+            <input type="checkbox" bind:checked={showAllSequences} />
+            Show all sequences
+          </label>
+          <span class="sequence-stats">
+            {sequenceStats.uniqueCollectors} collectors,
+            {sequenceStats.uniqueSequences} unique patterns
+          </span>
+        </div>
+      </div>
+      <div class="canvas-container">
+        <canvas bind:this={canvas4Element}></canvas>
+      </div>
+      {#if showSequenceDetails && selectedSequence}
+        <div class="sequence-details">
+          <h3>Sequence Details</h3>
+          <div class="timeline">
+            {#each selectedSequence as step, i}
+              <div class="step">
+                <div class="token">{step.token}</div>
+                <div class="time">
+                  {#if i === 0}
+                    <div class="datetime">
+                      <span class="date">{step.formattedDate}</span>
+                      <span class="time">{step.formattedTime}</span>
+                    </div>
+                  {:else}
+                    <div class="datetime">
+                      <span class="date">{step.formattedDate}</span>
+                      <span class="time"
+                        >+{(step.timeGap / 60).toFixed(1)} min</span
+                      >
+                    </div>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
@@ -669,5 +1054,80 @@
     border: 1px solid #ddd;
     background-color: white;
     font-size: 1rem;
+  }
+  .sequence-controls {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  .sequence-stats {
+    font-size: 0.9rem;
+    color: #666;
+  }
+
+  .sequence-details {
+    margin-top: 1rem;
+    padding: 1rem;
+    background: #f5f5f5;
+    border-radius: 4px;
+  }
+
+  .timeline {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 0.5rem;
+    overflow-x: auto;
+    padding: 0.5rem;
+  }
+
+  .step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .token {
+    padding: 0.5rem;
+    background: white;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  }
+
+  .time {
+    font-size: 0.8rem;
+    color: #666;
+  }
+
+  .datetime {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.2rem;
+  }
+
+  .date {
+    font-size: 0.75rem;
+    color: #666;
+  }
+
+  .time {
+    font-size: 0.8rem;
+    color: #444;
+    font-weight: 500;
+  }
+
+  .show-all {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    color: #666;
+  }
+
+  .show-all input[type="checkbox"] {
+    margin: 0;
   }
 </style>
