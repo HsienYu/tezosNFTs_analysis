@@ -435,8 +435,21 @@
     });
   }
 
+  function getTimeKeyFromDate(date, granularity) {
+    switch (granularity) {
+      case "hour":
+        return new Date(date).toISOString().slice(0, 13); // YYYY-MM-DDTHH
+      case "halfday":
+        const hours = new Date(date).getHours();
+        const period = hours < 12 ? "AM" : "PM";
+        return `${new Date(date).toISOString().slice(0, 10)}-${period}`; // YYYY-MM-DD-AM/PM
+      default: // day
+        return new Date(date).toISOString().slice(0, 10); // YYYY-MM-DD
+    }
+  }
+
   function processTimeSeriesData(tokens, granularity) {
-    const timeData = {};
+    const timeData = new Map();
 
     tokens.forEach((token) => {
       if (!token.transfers) return;
@@ -448,36 +461,24 @@
       );
 
       claimTransfers.forEach((transfer) => {
-        const date = new Date(transfer.timestamp);
-        let timeKey;
+        const timeKey = getTimeKeyFromDate(transfer.timestamp, granularity);
 
-        switch (granularity) {
-          case "hour":
-            timeKey = date.toISOString().slice(0, 13); // YYYY-MM-DDTHH
-            break;
-          case "halfday":
-            const period = date.getHours() < 12 ? "AM" : "PM";
-            timeKey = `${date.toISOString().slice(0, 10)}-${period}`; // YYYY-MM-DD-AM/PM
-            break;
-          default: // day
-            timeKey = date.toISOString().slice(0, 10); // YYYY-MM-DD
-        }
-
-        if (!timeData[timeKey]) {
-          timeData[timeKey] = {
-            timestamp: date.getTime(),
+        if (!timeData.has(timeKey)) {
+          timeData.set(timeKey, {
+            timestamp: new Date(transfer.timestamp).getTime(),
             claims: 0,
             locations: {},
-          };
+          });
         }
 
-        timeData[timeKey].claims++;
-        timeData[timeKey].locations[token.location] =
-          (timeData[timeKey].locations[token.location] || 0) + 1;
+        const data = timeData.get(timeKey);
+        data.claims++;
+        data.locations[token.location] =
+          (data.locations[token.location] || 0) + 1;
       });
     });
 
-    return Object.entries(timeData)
+    return Array.from(timeData.entries())
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, data]) => ({
         time: key,
@@ -543,7 +544,7 @@
     });
   }
 
-  $: if (!loading && selectedLocation) {
+  $: if (!loading && (selectedLocation || timeGranularity)) {
     updateFilteredTokens();
     createChart();
     createDurationChart();
