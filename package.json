@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "chart.js": "^4.0.0",
+    "chartjs-chart-treemap": "^3.1.0",
     "flowbite": "^2.5.2",
     "flowbite-svelte": "^0.47.4"
   }

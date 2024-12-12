@@ -35,13 +35,14 @@
   let chart4;
   let canvas4Element;
 
-  // Add new state variables
-  let selectedSequenceLength = 0;
-  let availableSequenceLengths = [];
+  // Update the state variables initialization
+  let selectedSequenceLength = 2; // Change from 0 to 2 as minimum sequence length
+  let availableSequenceLengths = [2]; // Initialize with minimum sequence length
   let sequenceStats = {
     totalSequences: 0,
     uniqueSequences: 0,
     maxLength: 0,
+    uniqueCollectors: 0, // Add this
   };
 
   // Add new state variables for sequence visualization
@@ -51,6 +52,13 @@
 
   // Add new state variable
   let showAllSequences = false;
+
+  let chart5;
+  let canvas5Element;
+
+  // Add new state variables for set visualization
+  let selectedSet = null;
+  let showSetDetails = false;
 
   async function calculateTokenCollectionRate(token) {
     try {
@@ -249,6 +257,7 @@
       createDurationChart();
       createTimeSeriesChart();
       createSequenceChart();
+      createCollectorSetChart();
     } catch (error) {
       console.error("Error loading data:", error);
       loading = false;
@@ -570,56 +579,45 @@
         ? tokens
         : tokens.filter((t) => t.location === selectedLocation);
 
-    // Create timeline of all claims with additional validation
+    // Create timeline of all claims
     const allClaims = [];
-    const claimRegistry = new Set(); // For duplicate detection
+    const collectorTokens = new Map();
 
     locationTokens.forEach((token) => {
       if (!token.transfers) return;
 
-      // Enhanced filtering to exclude burned and invalid transfers
       const claims = token.transfers
-        .filter((t) => {
-          // Exclude transfers that:
-          // 1. Aren't from AkaDrop
-          // 2. Are to excluded/burned addresses
-          // 3. Are part of burn transactions
-          return (
+        .filter(
+          (t) =>
             t.from.address === AkaDropAddress &&
             ![BurnedAddress, ExcludedAddress].includes(t.to.address) &&
             Number(t.amount) > 0
-          );
-        })
-        .map((transfer) => {
-          const claimKey = `${transfer.to.address}-${token.tokenId}-${transfer.timestamp}`;
-          if (claimRegistry.has(claimKey)) {
-            console.warn(`Duplicate claim detected: ${claimKey}`);
-            return null;
-          }
-          claimRegistry.add(claimKey);
-
-          const date = new Date(transfer.timestamp);
-          return {
-            tokenId: token.tokenId,
-            tokenName: token.name.replace(/Kairos NFT #/g, "#"),
-            timestamp: date.getTime(),
-            collector: transfer.to.address,
-            location: token.location,
-            formattedTime: date.toLocaleTimeString(),
-            formattedDate: date.toLocaleDateString(), // Add date
-          };
-        })
-        .filter((claim) => claim !== null);
+        )
+        .map((transfer) => ({
+          tokenId: token.tokenId,
+          tokenName: token.name,
+          timestamp: new Date(transfer.timestamp).getTime(),
+          collector: transfer.to.address,
+          location: token.location,
+          formattedTime: new Date(transfer.timestamp).toLocaleTimeString(),
+          formattedDate: new Date(transfer.timestamp).toLocaleDateString(),
+        }));
 
       allClaims.push(...claims);
+
+      claims.forEach((claim) => {
+        if (!collectorTokens.has(claim.collector)) {
+          collectorTokens.set(claim.collector, new Set());
+        }
+        collectorTokens.get(claim.collector).add(claim.tokenId);
+      });
     });
 
-    // Validate and sort claims
-    allClaims.sort((a, b) => a.timestamp - b.timestamp);
-    console.log(`Processed ${allClaims.length} validated claims`);
-
-    // Group by collector with timing information
+    // Sort claims by timestamp for each collector
     const collectorSequences = new Map();
+
+    allClaims.sort((a, b) => a.timestamp - b.timestamp);
+
     allClaims.forEach((claim) => {
       if (!collectorSequences.has(claim.collector)) {
         collectorSequences.set(claim.collector, []);
@@ -628,27 +626,28 @@
       const lastClaim = claims[claims.length - 1];
 
       claim.timeSinceLast = lastClaim
-        ? (claim.timestamp - lastClaim.timestamp) / 1000 // in seconds
+        ? (claim.timestamp - lastClaim.timestamp) / 1000
         : 0;
 
       claims.push(claim);
     });
 
-    // Process sequences with timing
+    // Process sequences with length validation
     const sequences = new Map();
     let maxLength = 0;
 
     collectorSequences.forEach((claims, collector) => {
       maxLength = Math.max(maxLength, claims.length);
 
-      // Generate sequences for different lengths
+      // Process all possible sequence lengths from 2 up to the claims length
       for (let len = 2; len <= claims.length; len++) {
         const sequence = claims.slice(0, len).map((c, i) => ({
-          token: c.tokenName,
+          token: c.tokenId,
+          name: c.tokenName,
           timeGap: c.timeSinceLast,
           timestamp: c.timestamp,
           formattedTime: c.formattedTime,
-          formattedDate: c.formattedDate, // Add date
+          formattedDate: c.formattedDate,
         }));
 
         const key = len;
@@ -656,76 +655,62 @@
           sequences.set(key, new Map());
         }
 
-        const sequenceKey = JSON.stringify(sequence);
-        const count = sequences.get(key).get(sequenceKey) || 0;
-        sequences.get(key).set(sequenceKey, count + 1);
+        const sequenceKey = JSON.stringify(sequence.map((s) => s.token));
+        const sequenceData = sequences.get(key).get(sequenceKey) || {
+          sequence,
+          collectors: new Set(),
+        };
+        sequenceData.collectors.add(collector);
+        sequences.get(key).set(sequenceKey, sequenceData);
       }
     });
 
-    // Update UI state
+    // Update available sequence lengths
     availableSequenceLengths = Array.from(sequences.keys()).sort(
       (a, b) => a - b
     );
+
+    // If current selection is invalid, select the shortest sequence length
     if (!availableSequenceLengths.includes(selectedSequenceLength)) {
-      selectedSequenceLength = availableSequenceLengths[0] || 0;
+      selectedSequenceLength = availableSequenceLengths[0] || 2;
     }
 
+    // Update stats with correct counts
     sequenceStats = {
       totalSequences: allClaims.length,
       uniqueSequences: sequences.get(selectedSequenceLength)?.size || 0,
       maxLength,
       uniqueCollectors: collectorSequences.size,
+      finalSets: collectorTokens.size,
     };
 
-    return sequences;
+    return { sequences, collectorTokens };
   }
 
   function createSequenceChart() {
     if (!canvas4Element) return;
     if (chart4) chart4.destroy();
 
-    const sequences = processCollectionPatterns(filteredTokens);
+    const { sequences } = processCollectionPatterns(filteredTokens);
     const currentSequences = sequences.get(selectedSequenceLength);
     if (!currentSequences) return;
 
-    // Process sequences for visualization with improved validation
+    // Process sequences for visualization
     const sortedSequences = Array.from(currentSequences.entries())
-      .map(([seqStr, count]) => {
-        const sequence = JSON.parse(seqStr);
-        // Verify sequence data integrity
-        const isValidSequence = sequence.every(
-          (s) =>
-            s.token &&
-            typeof s.timeGap === "number" &&
-            s.timestamp &&
-            s.formattedTime
-        );
-        if (!isValidSequence) {
-          console.warn("Invalid sequence detected:", sequence);
-          return null;
-        }
-        return { sequence, count };
-      })
-      .filter((item) => item !== null)
+      .map(([sequenceKey, { sequence, collectors }]) => ({
+        sequence,
+        count: collectors.size,
+      }))
       .sort((a, b) => b.count - a.count)
-      // Modify slice based on showAllSequences
       .slice(0, showAllSequences ? undefined : 20);
-
-    // Enhanced label formatting function
-    const getShortLabel = (sequence) => {
-      const tokens = sequence.map((s) => s.token);
-      if (tokens.length <= 2) return tokens.join(" → ");
-      if (tokens.length === 3)
-        return `${tokens[0]} → ${tokens[1]} → ${tokens[2]}`;
-      // For longer sequences, show first, count, and last
-      return `${tokens[0]} (+${tokens.length - 2}) ${tokens[tokens.length - 1]}`;
-    };
 
     const ctx = canvas4Element.getContext("2d");
     chart4 = new Chart(ctx, {
       type: "bar",
       data: {
-        labels: sortedSequences.map(({ sequence }) => getShortLabel(sequence)),
+        labels: sortedSequences.map(({ sequence }) =>
+          sequence.map((s) => s.token).join(" → ")
+        ),
         datasets: [
           {
             label: `${selectedSequenceLength}-Token Sequences`,
@@ -742,39 +727,11 @@
         indexAxis: "y",
         responsive: true,
         maintainAspectRatio: false,
-        onClick: (event, elements, chart) => {
-          const rect = chart.canvas.getBoundingClientRect();
-          const mouseY = event.clientY - rect.top;
-
-          // First check for bar clicks
-          const points = chart.getElementsAtEventForMode(
-            event,
-            "nearest",
-            { intersect: true },
-            true
-          );
-
-          if (points.length > 0) {
-            const idx = points[0].index;
+        onClick: (event, elements) => {
+          if (elements.length > 0) {
+            const idx = elements[0].index;
             selectedSequence = sortedSequences[idx].sequence;
             showSequenceDetails = true;
-            return;
-          }
-
-          // Then check for y-axis label clicks
-          const yAxis = chart.scales.y;
-          const ticks = yAxis.ticks;
-
-          for (let i = 0; i < ticks.length; i++) {
-            const tick = ticks[i];
-            const tickCenter = yAxis.getPixelForTick(i);
-
-            // Create a clickable area around the tick
-            if (Math.abs(mouseY - tickCenter) < 10) {
-              selectedSequence = sortedSequences[i].sequence;
-              showSequenceDetails = true;
-              break;
-            }
           }
         },
         plugins: {
@@ -783,25 +740,24 @@
             text: [
               `Top ${showAllSequences ? "All" : "20"} Collection Sequences (Length: ${selectedSequenceLength})`,
               `${sequenceStats.uniqueSequences} unique patterns by ${sequenceStats.uniqueCollectors} collectors`,
-              "Click bar or label to view sequence details",
+              "Click bar to view sequence details",
             ],
             padding: 20,
           },
           tooltip: {
             callbacks: {
               title: (context) => {
-                const sequence = sortedSequences[context[0].dataIndex].sequence;
                 return `Collection Sequence #${context[0].dataIndex + 1}`;
               },
               label: (context) => {
-                const sequence = sortedSequences[context.dataIndex].sequence;
+                const { sequence } = sortedSequences[context.dataIndex];
                 const count = context.raw;
                 const percentage = (
                   (count / sequenceStats.uniqueCollectors) *
                   100
                 ).toFixed(1);
                 const totalTime =
-                  sequence.reduce((sum, s) => sum + (s.timeGap || 0), 0) / 60; // Convert to minutes
+                  sequence.reduce((sum, s) => sum + (s.timeGap || 0), 0) / 60;
 
                 return [
                   `${count} collectors (${percentage}% of total)`,
@@ -816,16 +772,153 @@
                 ];
               },
             },
-            position: "nearest",
-            intersect: false,
-            backgroundColor: "rgba(0,0,0,0.85)",
-            titleFont: { size: 14, weight: "bold" },
-            bodyFont: { size: 12 },
-            padding: 12,
-            displayColors: false,
           },
-          legend: {
-            display: false,
+        },
+        scales: {
+          x: {
+            title: {
+              display: true,
+              text: "Number of Collectors",
+            },
+            ticks: {
+              stepSize: 1,
+              precision: 0,
+            },
+          },
+          y: {
+            ticks: {
+              font: { size: 11 },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  function getTokenUrl(tokenId) {
+    return `https://kairos-mint.art/claimsToken/${ContractAddress}/${tokenId}`;
+  }
+
+  function processCollectorSets(tokens) {
+    const { collectorTokens } = processCollectionPatterns(tokens);
+
+    // Convert sets to patterns
+    const setPatterns = new Map();
+    collectorTokens.forEach((tokenSet, collector) => {
+      const setKey = Array.from(tokenSet).sort().join(",");
+      if (!setPatterns.has(setKey)) {
+        setPatterns.set(setKey, {
+          tokens: Array.from(tokenSet),
+          collectors: new Set([collector]),
+          count: 1,
+        });
+      } else {
+        const pattern = setPatterns.get(setKey);
+        pattern.collectors.add(collector);
+        pattern.count++;
+      }
+    });
+
+    return Array.from(setPatterns.values()).sort((a, b) => {
+      const aTokens = a.tokens.length;
+      const bTokens = b.tokens.length;
+      if (aTokens === bTokens) {
+        return b.count - a.count;
+      }
+      return bTokens - aTokens;
+    });
+  }
+
+  function createCollectorSetChart() {
+    if (!canvas5Element) return;
+    if (chart5) chart5.destroy();
+
+    const setPatterns = processCollectorSets(filteredTokens);
+
+    // Group patterns by token count
+    const groupedPatterns = setPatterns.reduce((acc, pattern) => {
+      const size = pattern.tokens.length;
+      if (!acc[size]) acc[size] = [];
+      acc[size].push(pattern);
+      return acc;
+    }, {});
+
+    // Prepare data for horizontal bar chart
+    const labels = [];
+    const counts = [];
+    const bgColors = [];
+    const hoverLabels = [];
+
+    Object.entries(groupedPatterns).forEach(([size, patterns], groupIndex) => {
+      patterns.forEach((pattern, idx) => {
+        labels.push(`${size} tokens: ${pattern.tokens.join(", ")}`);
+        counts.push(pattern.count);
+        bgColors.push(
+          `hsl(${(groupIndex * 360) / Object.keys(groupedPatterns).length}, 70%, 60%)`
+        );
+        hoverLabels.push({
+          size,
+          tokens: pattern.tokens,
+          collectors: pattern.count,
+        });
+      });
+    });
+
+    const ctx = canvas5Element.getContext("2d");
+    chart5 = new Chart(ctx, {
+      type: "bar",
+      data: {
+        labels,
+        datasets: [
+          {
+            label: "Number of Collectors",
+            data: counts,
+            backgroundColor: bgColors,
+            borderWidth: 1,
+          },
+        ],
+      },
+      options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        onClick: (event, elements) => {
+          if (elements.length > 0) {
+            const idx = elements[0].index;
+            selectedSet = {
+              tokens: hoverLabels[idx].tokens,
+              collectors: hoverLabels[idx].collectors,
+              size: hoverLabels[idx].size,
+            };
+            showSetDetails = true;
+          }
+        },
+        plugins: {
+          title: {
+            display: true,
+            text: [
+              "Token Collection Sets",
+              `${setPatterns.length} unique patterns found`,
+              "Sorted by set size and popularity",
+            ],
+            padding: 20,
+          },
+          tooltip: {
+            callbacks: {
+              title: (context) => {
+                const pattern = hoverLabels[context[0].dataIndex];
+                return `Set with ${pattern.size} tokens`;
+              },
+              label: (context) => {
+                const pattern = hoverLabels[context.dataIndex];
+                return [
+                  `${pattern.collectors} collectors`,
+                  "",
+                  "Tokens in set:",
+                  ...pattern.tokens.map((token) => `Token ${token}`),
+                ];
+              },
+            },
           },
         },
         scales: {
@@ -839,30 +932,17 @@
               stepSize: 1,
               precision: 0,
             },
-            grid: {
-              display: true,
-              color: "rgba(0,0,0,0.1)",
-            },
           },
           y: {
             ticks: {
               callback: function (val) {
                 const label = this.getLabelForValue(val);
-                return label.replace(/Kairos NFT /g, "").replace(/[#]/g, "");
+                // Only show token count in axis label
+                return label.split(":")[0];
               },
-              font: {
-                size: 11,
-                weight: 500,
-              },
-              color: "#0066cc",
-            },
-            grid: {
-              display: false,
+              font: { size: 11 },
             },
           },
-        },
-        animation: {
-          duration: 500,
         },
       },
     });
@@ -880,6 +960,7 @@
     createDurationChart();
     createTimeSeriesChart();
     createSequenceChart();
+    createCollectorSetChart();
   }
 </script>
 
@@ -971,7 +1052,16 @@
           <div class="timeline">
             {#each selectedSequence as step, i}
               <div class="step">
-                <div class="token">{step.token}</div>
+                <div class="token">
+                  <div class="token-id">
+                    ID: <a
+                      href={getTokenUrl(step.token)}
+                      target="_blank"
+                      class="token-link">{step.token}</a
+                    >
+                  </div>
+                  <div class="token-name">{step.name}</div>
+                </div>
                 <div class="time">
                   {#if i === 0}
                     <div class="datetime">
@@ -987,6 +1077,46 @@
                     </div>
                   {/if}
                 </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+    <div class="chart-section">
+      <h2>Collection Set Analysis</h2>
+      <h4>*Shows all unique token combinations and their collector counts*</h4>
+      <h5>*Click bar to show set details*</h5>
+      <div class="set-controls">
+        <div class="set-summary">
+          Total unique patterns: {processCollectorSets(filteredTokens).length}
+        </div>
+      </div>
+      <div class="canvas-container canvas-container-large">
+        <canvas bind:this={canvas5Element}></canvas>
+      </div>
+      {#if showSetDetails && selectedSet}
+        <div class="set-details">
+          <h3>Set Details</h3>
+          <div class="set-summary-stats">
+            <span>Total Tokens: {selectedSet.size}</span>
+            <span>Total Collectors: {selectedSet.collectors}</span>
+          </div>
+          <div class="token-grid">
+            {#each selectedSet.tokens as tokenId}
+              <div class="token-card">
+                <div class="token-id">
+                  ID: <a
+                    href={getTokenUrl(tokenId)}
+                    target="_blank"
+                    class="token-link">{tokenId}</a
+                  >
+                </div>
+                {#if filteredTokens.find((t) => t.tokenId === tokenId)}
+                  <div class="token-name">
+                    {filteredTokens.find((t) => t.tokenId === tokenId).name}
+                  </div>
+                {/if}
               </div>
             {/each}
           </div>
@@ -1129,5 +1259,81 @@
 
   .show-all input[type="checkbox"] {
     margin: 0;
+  }
+
+  .token {
+    padding: 0.5rem;
+    background: white;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    text-align: center;
+  }
+
+  .token-id {
+    font-weight: bold;
+    color: #0066cc;
+    margin-bottom: 0.2rem;
+  }
+
+  .token-name {
+    font-size: 0.85rem;
+    color: #666;
+    word-break: break-word;
+    max-width: 150px;
+  }
+
+  .token-link {
+    color: #0066cc;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .token-link:hover {
+    text-decoration: underline;
+  }
+
+  .canvas-container-large {
+    height: 800px; /* Increased height for better visibility */
+  }
+
+  .set-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+
+  .set-summary {
+    font-size: 0.9rem;
+    color: #666;
+  }
+
+  .set-details {
+    margin-top: 1rem;
+    padding: 1rem;
+    background: #f5f5f5;
+    border-radius: 4px;
+  }
+
+  .set-summary-stats {
+    display: flex;
+    gap: 2rem;
+    margin: 1rem 0;
+    font-size: 1.1rem;
+    color: #444;
+  }
+
+  .token-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .token-card {
+    background: white;
+    padding: 1rem;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
   }
 </style>
