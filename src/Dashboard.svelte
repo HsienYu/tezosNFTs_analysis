@@ -60,6 +60,33 @@
   let selectedSet = null;
   let showSetDetails = false;
 
+  // Add rate limiting utility
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function fetchWithRetry(url, maxRetries = 3, delayMs = 1000) {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        const response = await fetch(url);
+        if (response.status === 429) {
+          // Rate limit hit
+          console.log(
+            `Rate limit hit, waiting ${delayMs}ms before retry ${i + 1}/${maxRetries}`
+          );
+          await sleep(delayMs);
+          continue;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return await response.json();
+      } catch (error) {
+        if (i === maxRetries - 1) throw error;
+        console.log(`Attempt ${i + 1} failed, retrying...`);
+        await sleep(delayMs);
+      }
+    }
+  }
+
   async function calculateTokenCollectionRate(token) {
     try {
       console.log(`Processing token ${token.tokenId}:`, {
@@ -68,27 +95,24 @@
         symbol: token.metadata?.symbol,
       });
 
-      const balancesResponse = await fetch(
+      // Use the new fetchWithRetry function for all API calls
+      const balances = await fetchWithRetry(
         `https://api.tzkt.io/v1/tokens/balances?token.contract=${ContractAddress}&token.tokenId=${token.tokenId}`
       );
-      const balances = await balancesResponse.json();
 
-      // Get historical transfers to/from AkaDrop to calculate original drop amount
-      const transfersResponse = await fetch(
+      const transfers = await fetchWithRetry(
         `https://api.tzkt.io/v1/tokens/transfers?token.contract=${ContractAddress}&token.tokenId=${token.tokenId}&to=${AkaDropAddress}`
       );
-      const transfers = await transfersResponse.json();
 
+      const allTransfers = await fetchWithRetry(
+        `https://api.tzkt.io/v1/tokens/transfers?token.contract=${ContractAddress}&token.tokenId=${token.tokenId}&sort.desc=timestamp`
+      );
+
+      // Calculate original drop amount from transfers
       const originalDropAmount = transfers.reduce(
         (sum, t) => sum + Number(t.amount),
         0
       );
-
-      // Get all transfers for duration analysis
-      const allTransfersResponse = await fetch(
-        `https://api.tzkt.io/v1/tokens/transfers?token.contract=${ContractAddress}&token.tokenId=${token.tokenId}&sort.desc=timestamp`
-      );
-      const allTransfers = await allTransfersResponse.json();
 
       // Filter out burned address from balances first
       const activeBalances = balances.filter(
@@ -170,7 +194,7 @@
         claimedDropAmount: originalDropAmount - currentAkaDropAmount,
         durationMins,
         transferCount: validTransfers.length,
-        transfers: validTransfers, // Add this line to include transfers
+        transfers: validTransfers,
       };
     } catch (error) {
       console.error(`Error processing token ${token.tokenId}:`, error);
@@ -182,10 +206,12 @@
     try {
       loadingProgress = 10;
       console.log("Fetching tokens from contract...");
-      const response = await fetch(
+
+      // Use fetchWithRetry for initial token fetch
+      const allTokens = await fetchWithRetry(
         `https://api.tzkt.io/v1/tokens?contract=${ContractAddress}`
       );
-      const allTokens = await response.json();
+
       debugStats.totalTokensFetched = allTokens.length;
 
       console.log("Total tokens fetched:", debugStats.totalTokensFetched);
@@ -211,7 +237,9 @@
       totalTokenCount = tokens.length;
       loadingProgress = 30;
 
-      const batchSize = 10;
+      // Modify the batch processing to include delays between batches
+      const batchSize = 5; // Reduce batch size
+      const batchDelay = 1000; // 1 second delay between batches
       const results = [];
 
       for (let i = 0; i < tokens.length; i += batchSize) {
@@ -221,6 +249,11 @@
         );
         results.push(...batchResults.filter((r) => r !== null));
         loadingProgress = 30 + (70 * (i + batchSize)) / tokens.length;
+
+        // Add delay between batches
+        if (i + batchSize < tokens.length) {
+          await sleep(batchDelay);
+        }
       }
 
       tokenCollectionRates = results;
@@ -583,34 +616,44 @@
     const allClaims = [];
     const collectorTokens = new Map();
 
-    locationTokens.forEach((token) => {
-      if (!token.transfers) return;
+    // Process tokens in consistent order
+    locationTokens
+      .sort((a, b) => a.tokenId.localeCompare(b.tokenId))
+      .forEach((token) => {
+        if (!token.transfers) return;
 
-      const claims = token.transfers
-        .filter(
-          (t) =>
-            t.from.address === AkaDropAddress &&
-            ![BurnedAddress, ExcludedAddress].includes(t.to.address) &&
-            Number(t.amount) > 0
-        )
-        .map((transfer) => ({
-          tokenId: token.tokenId,
-          tokenName: token.name,
-          timestamp: new Date(transfer.timestamp).getTime(),
-          collector: transfer.to.address,
-          location: token.location,
-          formattedTime: new Date(transfer.timestamp).toLocaleTimeString(),
-          formattedDate: new Date(transfer.timestamp).toLocaleDateString(),
-        }));
+        const claims = token.transfers
+          .filter(
+            (t) =>
+              t.from.address === AkaDropAddress &&
+              ![BurnedAddress, ExcludedAddress].includes(t.to.address) &&
+              Number(t.amount) > 0
+          )
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+          .map((transfer) => ({
+            tokenId: token.tokenId,
+            tokenName: token.name,
+            timestamp: new Date(transfer.timestamp).getTime(),
+            collector: transfer.to.address,
+            location: token.location,
+            formattedTime: new Date(transfer.timestamp).toLocaleTimeString(),
+            formattedDate: new Date(transfer.timestamp).toLocaleDateString(),
+          }));
 
-      allClaims.push(...claims);
+        allClaims.push(...claims);
 
-      claims.forEach((claim) => {
-        if (!collectorTokens.has(claim.collector)) {
-          collectorTokens.set(claim.collector, new Set());
-        }
-        collectorTokens.get(claim.collector).add(claim.tokenId);
+        claims.forEach((claim) => {
+          if (!collectorTokens.has(claim.collector)) {
+            collectorTokens.set(claim.collector, new Set());
+          }
+          collectorTokens.get(claim.collector).add(claim.tokenId);
+        });
       });
+
+    // Sort all claims by timestamp and then by tokenId for consistency
+    allClaims.sort((a, b) => {
+      const timeDiff = a.timestamp - b.timestamp;
+      return timeDiff === 0 ? a.tokenId.localeCompare(b.tokenId) : timeDiff;
     });
 
     // Sort claims by timestamp for each collector
@@ -802,30 +845,43 @@
   function processCollectorSets(tokens) {
     const { collectorTokens } = processCollectionPatterns(tokens);
 
-    // Convert sets to patterns
+    // Convert sets to patterns with deterministic ordering
     const setPatterns = new Map();
-    collectorTokens.forEach((tokenSet, collector) => {
-      const setKey = Array.from(tokenSet).sort().join(",");
-      if (!setPatterns.has(setKey)) {
-        setPatterns.set(setKey, {
-          tokens: Array.from(tokenSet),
-          collectors: new Set([collector]),
-          count: 1,
-        });
-      } else {
-        const pattern = setPatterns.get(setKey);
-        pattern.collectors.add(collector);
-        pattern.count++;
-      }
-    });
 
+    // Process collectors in a consistent order
+    Array.from(collectorTokens.keys())
+      .sort()
+      .forEach((collector) => {
+        const tokenSet = collectorTokens.get(collector);
+        const setKey = Array.from(tokenSet)
+          .sort((a, b) => a.localeCompare(b))
+          .join(",");
+
+        if (!setPatterns.has(setKey)) {
+          setPatterns.set(setKey, {
+            tokens: Array.from(tokenSet).sort((a, b) => a.localeCompare(b)),
+            collectors: new Set([collector]),
+            count: 1,
+          });
+        } else {
+          const pattern = setPatterns.get(setKey);
+          pattern.collectors.add(collector);
+          pattern.count++;
+        }
+      });
+
+    // Sort patterns consistently
     return Array.from(setPatterns.values()).sort((a, b) => {
-      const aTokens = a.tokens.length;
-      const bTokens = b.tokens.length;
-      if (aTokens === bTokens) {
-        return b.count - a.count;
-      }
-      return bTokens - aTokens;
+      // First by token count (descending)
+      const countDiff = b.tokens.length - a.tokens.length;
+      if (countDiff !== 0) return countDiff;
+
+      // Then by collector count (descending)
+      const collectorDiff = b.count - a.count;
+      if (collectorDiff !== 0) return collectorDiff;
+
+      // Finally by token IDs (ascending)
+      return a.tokens[0].localeCompare(b.tokens[0]);
     });
   }
 
