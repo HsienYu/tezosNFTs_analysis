@@ -6,10 +6,15 @@
   let chart;
   let loading = true;
   let loadingProgress = 0;
+  let loadingStatus = "Initializing...";
+  let retryCount = 0;
+  const MAX_RETRIES = 3;
+  const TIMEOUT_MS = 30000; // 30 seconds timeout
 
   const contractAddress = "KT1GyHsoewbUGk4wpAVZFUYpP2VjZPqo1qBf";
   const kairosAddress = "KT1PTS3pPk4FeneMmcJ3HZVe39wra1bomsaW";
   const BurnedAddress = "tz1burnburnburnburnburnburnburjAYjjX";
+  const AkaDropAddress = "KT1GyHsoewbUGk4wpAVZFUYpP2VjZPqo1qBf";
 
   let selectedLocation = "all";
   let locations = [];
@@ -17,60 +22,147 @@
   let selectedCategory = "all";
   let categories = [];
 
+  // Add request queue management
+  const requestQueue = [];
+  const requestCache = new Map();
+  let isProcessingQueue = false;
+
+  async function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function fetchWithTimeout(url, timeout = TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      throw error;
+    }
+  }
+
+  async function fetchBatchWithRetry(url, attempt = 0) {
+    try {
+      const response = await fetchWithTimeout(url);
+      if (response.status === 429) {
+        if (attempt >= MAX_RETRIES) throw new Error("Max retries reached");
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+        await sleep(delay);
+        return fetchBatchWithRetry(url, attempt + 1);
+      }
+      if (!response.ok)
+        throw new Error(`HTTP error! status: ${response.status}`);
+      return await response.json();
+    } catch (error) {
+      if (attempt >= MAX_RETRIES) throw error;
+      await sleep(1000 * Math.pow(2, attempt));
+      return fetchBatchWithRetry(url, attempt + 1);
+    }
+  }
+
   onMount(async () => {
     try {
-      loadingProgress = 25;
-      // Fetch mint data from new endpoint
-      const mintDataResponse = await fetch(
-        `https://api.tzkt.io/v1/tokens?contract=${kairosAddress}`
+      // Step 1: Fetch all tokens
+      loadingStatus = "Fetching token list...";
+      loadingProgress = 10;
+      const mintData = await fetchBatchWithRetry(
+        `https://api.tzkt.io/v1/tokens?contract=${kairosAddress}&metadata.symbol=Kairos%20NFTs`
       );
-      const mintData = await mintDataResponse.json();
+
+      const validTokens = mintData.filter(
+        (token) =>
+          token.metadata?.symbol === "Kairos NFTs" &&
+          token.metadata?.event_location
+      );
+
+      loadingProgress = 20;
+      loadingStatus = "Loading token balances...";
+
+      // Step 2: Fetch all transfers in one call
+      const allTransfers = await fetchBatchWithRetry(
+        `https://api.tzkt.io/v1/tokens/transfers?token.contract=${kairosAddress}&to=${AkaDropAddress}&limit=10000`
+      );
 
       loadingProgress = 50;
-      // Fetch transfer data for AKAdrop amounts
-      const transferDataResponse = await fetch(
-        `https://api.tzkt.io/v1/tokens/transfers?token.contract=${kairosAddress}`
-      );
-      const transferData = await transferDataResponse.json();
+      loadingStatus = "Processing token data...";
 
-      loadingProgress = 75;
-      const burnedTokensResponse = await fetch(
-        `https://api.tzkt.io/v1/tokens/transfers?to.eq=${BurnedAddress}&token.contract=${kairosAddress}`
-      );
-      const burnedTokens = await burnedTokensResponse.json();
-
-      const burnedTokenIds = new Set(
-        burnedTokens.map((token) => token.token.tokenId)
-      );
-
-      // Create a map of tokenId to transfer amount
-      const transferAmounts = {};
-      transferData.forEach((transfer) => {
-        if (!burnedTokenIds.has(transfer.token.tokenId)) {
-          transferAmounts[transfer.token.tokenId] = transfer.amount;
+      // Create a map for quick lookup
+      const transferMap = new Map();
+      allTransfers.forEach((transfer) => {
+        const tokenId = transfer.token.tokenId;
+        if (!transferMap.has(tokenId)) {
+          transferMap.set(tokenId, []);
         }
+        transferMap.get(tokenId).push(transfer);
       });
 
-      // Process and combine data
-      nftData = mintData
-        .filter((token) => !burnedTokenIds.has(token.tokenId))
-        .map((token) => ({
-          tokenId: token.tokenId,
-          date: token.metadata.date,
-          name: token.metadata.name,
-          tags: token.metadata.tags,
-          category: token.metadata.category,
-          geoLocation: token.metadata.geoLocation,
-          event_location: token.metadata.event_location,
-          totalSupply: token.totalSupply,
-          amount: transferAmounts[token.tokenId] || 0,
-        }));
+      // Step 3: Process tokens in efficient batches
+      const batchSize = 10;
+      const processedData = [];
 
+      for (let i = 0; i < validTokens.length; i += batchSize) {
+        loadingStatus = `Processing tokens ${i + 1} to ${Math.min(i + batchSize, validTokens.length)} of ${validTokens.length}...`;
+        loadingProgress = 50 + (40 * i) / validTokens.length;
+
+        const batch = validTokens.slice(i, i + batchSize);
+        const batchPromises = batch.map(async (token) => {
+          try {
+            const balances = await fetchBatchWithRetry(
+              `https://api.tzkt.io/v1/tokens/balances?token.contract=${kairosAddress}&token.tokenId=${token.tokenId}`
+            );
+
+            const tokenTransfers = transferMap.get(token.tokenId) || [];
+            const originalAkaDropAmount = tokenTransfers.reduce(
+              (sum, t) => sum + Number(t.amount),
+              0
+            );
+
+            const currentAkaDropBalance = Number(
+              balances.find((b) => b.account?.address === AkaDropAddress)
+                ?.balance || 0
+            );
+
+            const isTokenBurned = balances.some(
+              (b) =>
+                b.account?.address === BurnedAddress && Number(b.balance) > 0
+            );
+
+            if (isTokenBurned) return null;
+
+            return {
+              tokenId: token.tokenId,
+              date: token.metadata?.date,
+              name: token.metadata?.name,
+              tags: token.metadata?.tags,
+              category: token.metadata?.category,
+              event_location: token.metadata?.event_location,
+              totalSupply: token.totalSupply,
+              originalAkaDropAmount,
+              currentAkaDropBalance,
+              claimedAmount: originalAkaDropAmount - currentAkaDropBalance,
+            };
+          } catch (error) {
+            console.error(`Error processing token ${token.tokenId}:`, error);
+            return null;
+          }
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        processedData.push(...batchResults.filter(Boolean));
+        await sleep(1000); // Delay between batches
+      }
+
+      nftData = processedData;
+
+      // Update filters
       locations = [
         "all",
         ...new Set(nftData.map((item) => item.event_location).filter(Boolean)),
       ];
-
       categories = [
         "all",
         ...new Set(nftData.map((item) => item.category).filter(Boolean)),
@@ -81,7 +173,15 @@
       loading = false;
     } catch (error) {
       console.error("Error loading data:", error);
-      loading = false;
+      loadingStatus = `Error: ${error.message}. Retrying...`;
+      if (retryCount < MAX_RETRIES) {
+        retryCount++;
+        await sleep(2000);
+        onMount(); // Retry loading
+      } else {
+        loadingStatus = "Failed to load data. Please refresh the page.";
+        loading = false;
+      }
     }
   });
 
@@ -129,17 +229,24 @@
         labels: filteredData.map((item) => item.name),
         datasets: [
           {
-            label: "Mint Amount",
+            label: "Total Supply",
             data: filteredData.map((item) => item.totalSupply),
             backgroundColor: "rgba(75, 192, 192, 0.2)",
             borderColor: "rgba(75, 192, 192, 1)",
             borderWidth: 1,
           },
           {
-            label: "AKAdrop Amount",
-            data: filteredData.map((item) => item.amount),
+            label: "Original AKAdrop Amount",
+            data: filteredData.map((item) => item.originalAkaDropAmount),
             backgroundColor: "rgba(153, 102, 255, 0.2)",
             borderColor: "rgba(153, 102, 255, 1)",
+            borderWidth: 1,
+          },
+          {
+            label: "Current AKAdrop Balance",
+            data: filteredData.map((item) => item.currentAkaDropBalance),
+            backgroundColor: "rgba(255, 99, 132, 0.2)",
+            borderColor: "rgba(255, 99, 132, 1)",
             borderWidth: 1,
           },
         ],
@@ -159,21 +266,13 @@
                 const value = context.raw;
                 const item = filteredData[dataIndex];
 
-                if (datasetLabel === "Mint Amount") {
-                  return [
-                    `${datasetLabel}: ${value}`,
-                    `Date: ${new Date(item.date).toLocaleDateString()}`,
-                    `Category: ${item.category || "N/A"}`,
-                    `Tags: ${item.tags ? item.tags.join(", ") : "N/A"}`,
-                    `Location: ${item.event_location || "N/A"}`,
-                  ];
-                } else if (datasetLabel === "AKAdrop Amount") {
-                  return [
-                    `${datasetLabel}: ${value}`,
-                    `Timestamp: ${new Date(item.date).toLocaleString()}`,
-                  ];
-                }
-                return `${datasetLabel}: ${value}`;
+                return [
+                  `${datasetLabel}: ${value}`,
+                  `Date: ${new Date(item.date).toLocaleDateString()}`,
+                  `Category: ${item.category || "N/A"}`,
+                  `Location: ${item.event_location || "N/A"}`,
+                  `Claimed Amount: ${item.claimedAmount}`,
+                ];
               },
             },
           },
@@ -224,7 +323,8 @@
       <div class="progress-bar">
         <div class="progress-bar-inner" style="width: {loadingProgress}%"></div>
       </div>
-      <p>Loading data... {Math.round(loadingProgress)}%</p>
+      <p class="loading-status">{loadingStatus}</p>
+      <p class="loading-progress">{Math.round(loadingProgress)}%</p>
     </div>
   {:else}
     <canvas id="nftChart" width="400" height="200"></canvas>
@@ -291,6 +391,17 @@
   .loading p {
     margin-top: 1rem;
     font-size: 0.9rem;
+  }
+
+  .loading-status {
+    margin-top: 1rem;
+    font-size: 1rem;
+    color: #666;
+  }
+
+  .loading-progress {
+    font-size: 0.9rem;
+    color: #999;
   }
 
   @keyframes progress {
