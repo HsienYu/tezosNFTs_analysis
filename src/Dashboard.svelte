@@ -612,11 +612,10 @@
         ? tokens
         : tokens.filter((t) => t.location === selectedLocation);
 
-    // Create timeline of all claims
     const allClaims = [];
     const collectorTokens = new Map();
 
-    // Process tokens in consistent order
+    // First, collect all claims and sort them by timestamp
     locationTokens
       .sort((a, b) => a.tokenId.localeCompare(b.tokenId))
       .forEach((token) => {
@@ -642,6 +641,7 @@
 
         allClaims.push(...claims);
 
+        // Track total tokens per collector
         claims.forEach((claim) => {
           if (!collectorTokens.has(claim.collector)) {
             collectorTokens.set(claim.collector, new Set());
@@ -650,17 +650,11 @@
         });
       });
 
-    // Sort all claims by timestamp and then by tokenId for consistency
-    allClaims.sort((a, b) => {
-      const timeDiff = a.timestamp - b.timestamp;
-      return timeDiff === 0 ? a.tokenId.localeCompare(b.tokenId) : timeDiff;
-    });
-
-    // Sort claims by timestamp for each collector
-    const collectorSequences = new Map();
-
+    // Sort all claims by timestamp
     allClaims.sort((a, b) => a.timestamp - b.timestamp);
 
+    // Group claims by collector
+    const collectorSequences = new Map();
     allClaims.forEach((claim) => {
       if (!collectorSequences.has(claim.collector)) {
         collectorSequences.set(claim.collector, []);
@@ -675,16 +669,16 @@
       claims.push(claim);
     });
 
-    // Process sequences with length validation
+    // Process sequences with exact length matching
     const sequences = new Map();
     let maxLength = 0;
 
     collectorSequences.forEach((claims, collector) => {
       maxLength = Math.max(maxLength, claims.length);
 
-      // Process all possible sequence lengths from 2 up to the claims length
-      for (let len = 2; len <= claims.length; len++) {
-        const sequence = claims.slice(0, len).map((c, i) => ({
+      // Only process collectors who have exactly the selected number of tokens
+      if (claims.length === selectedSequenceLength) {
+        const sequence = claims.map((c, i) => ({
           token: c.tokenId,
           name: c.tokenName,
           timeGap: c.timeSinceLast,
@@ -693,32 +687,34 @@
           formattedDate: c.formattedDate,
         }));
 
-        const key = len;
-        if (!sequences.has(key)) {
-          sequences.set(key, new Map());
+        const sequenceKey = JSON.stringify(sequence.map((s) => s.token));
+        if (!sequences.has(selectedSequenceLength)) {
+          sequences.set(selectedSequenceLength, new Map());
         }
 
-        const sequenceKey = JSON.stringify(sequence.map((s) => s.token));
-        const sequenceData = sequences.get(key).get(sequenceKey) || {
+        const sequenceData = sequences
+          .get(selectedSequenceLength)
+          .get(sequenceKey) || {
           sequence,
           collectors: new Set(),
         };
         sequenceData.collectors.add(collector);
-        sequences.get(key).set(sequenceKey, sequenceData);
+        sequences.get(selectedSequenceLength).set(sequenceKey, sequenceData);
       }
     });
 
-    // Update available sequence lengths
-    availableSequenceLengths = Array.from(sequences.keys()).sort(
-      (a, b) => a - b
+    // Update available sequence lengths based on actual token counts
+    const tokenCounts = new Set(
+      Array.from(collectorSequences.values()).map((claims) => claims.length)
     );
+    availableSequenceLengths = Array.from(tokenCounts).sort((a, b) => a - b);
 
-    // If current selection is invalid, select the shortest sequence length
+    // If current selection is invalid, select the shortest available length
     if (!availableSequenceLengths.includes(selectedSequenceLength)) {
       selectedSequenceLength = availableSequenceLengths[0] || 2;
     }
 
-    // Update stats with correct counts
+    // Update stats
     sequenceStats = {
       totalSequences: allClaims.length,
       uniqueSequences: sequences.get(selectedSequenceLength)?.size || 0,
@@ -1004,6 +1000,36 @@
     });
   }
 
+  // Add new state variables for tabs
+  let activeSequenceTab = "timeline";
+  let activeSetTab = "tokens";
+
+  // Add collector data to sequence details
+  function getSequenceCollectors(sequence) {
+    const { sequences } = processCollectionPatterns(filteredTokens);
+    const currentSequences = sequences.get(selectedSequenceLength);
+    if (!currentSequences) return new Set();
+
+    const sequenceKey = JSON.stringify(sequence.map((s) => s.token));
+    return currentSequences.get(sequenceKey)?.collectors || new Set();
+  }
+
+  // Add collector data to set details
+  function getSetCollectors(tokenSet) {
+    const { collectorTokens } = processCollectionPatterns(filteredTokens);
+    const collectors = new Set();
+
+    collectorTokens.forEach((tokens, collector) => {
+      const collectorTokenIds = Array.from(tokens).sort();
+      const setTokenIds = tokenSet.sort();
+      if (JSON.stringify(collectorTokenIds) === JSON.stringify(setTokenIds)) {
+        collectors.add(collector);
+      }
+    });
+
+    return collectors;
+  }
+
   $: if (
     !loading &&
     (selectedLocation ||
@@ -1105,37 +1131,73 @@
       {#if showSequenceDetails && selectedSequence}
         <div class="sequence-details">
           <h3>Sequence Details</h3>
-          <div class="timeline">
-            {#each selectedSequence as step, i}
-              <div class="step">
-                <div class="token">
-                  <div class="token-id">
-                    ID: <a
-                      href={getTokenUrl(step.token)}
-                      target="_blank"
-                      class="token-link">{step.token}</a
-                    >
-                  </div>
-                  <div class="token-name">{step.name}</div>
-                </div>
-                <div class="time">
-                  {#if i === 0}
-                    <div class="datetime">
-                      <span class="date">{step.formattedDate}</span>
-                      <span class="time">{step.formattedTime}</span>
-                    </div>
-                  {:else}
-                    <div class="datetime">
-                      <span class="date">{step.formattedDate}</span>
-                      <span class="time"
-                        >+{(step.timeGap / 60).toFixed(1)} min</span
+          <div class="tab-buttons">
+            <button
+              class:active={activeSequenceTab === "timeline"}
+              on:click={() => (activeSequenceTab = "timeline")}
+            >
+              Timeline
+            </button>
+            <button
+              class:active={activeSequenceTab === "collectors"}
+              on:click={() => (activeSequenceTab = "collectors")}
+            >
+              Collectors
+            </button>
+          </div>
+
+          {#if activeSequenceTab === "timeline"}
+            <div class="timeline">
+              {#each selectedSequence as step, i}
+                <div class="step">
+                  <div class="token">
+                    <div class="token-id">
+                      ID: <a
+                        href={getTokenUrl(step.token)}
+                        target="_blank"
+                        class="token-link">{step.token}</a
                       >
                     </div>
-                  {/if}
+                    <div class="token-name">{step.name}</div>
+                  </div>
+                  <div class="time">
+                    {#if i === 0}
+                      <div class="datetime">
+                        <span class="date">{step.formattedDate}</span>
+                        <span class="time">{step.formattedTime}</span>
+                      </div>
+                    {:else}
+                      <div class="datetime">
+                        <span class="date">{step.formattedDate}</span>
+                        <span class="time"
+                          >+{(step.timeGap / 60).toFixed(1)} min</span
+                        >
+                      </div>
+                    {/if}
+                  </div>
                 </div>
-              </div>
-            {/each}
-          </div>
+              {/each}
+            </div>
+          {:else}
+            <div class="collectors-list">
+              <h4>
+                Collectors who completed this sequence ({getSequenceCollectors(
+                  selectedSequence
+                ).size})
+              </h4>
+              {#each Array.from(getSequenceCollectors(selectedSequence)) as collector}
+                <div class="collector-item">
+                  <a
+                    href={`https://tzkt.io/${collector}/balances`}
+                    target="_blank"
+                    class="collector-link"
+                  >
+                    {collector}
+                  </a>
+                </div>
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -1158,24 +1220,61 @@
             <span>Total Tokens: {selectedSet.size}</span>
             <span>Total Collectors: {selectedSet.collectors}</span>
           </div>
-          <div class="token-grid">
-            {#each selectedSet.tokens as tokenId}
-              <div class="token-card">
-                <div class="token-id">
-                  ID: <a
-                    href={getTokenUrl(tokenId)}
-                    target="_blank"
-                    class="token-link">{tokenId}</a
-                  >
-                </div>
-                {#if filteredTokens.find((t) => t.tokenId === tokenId)}
-                  <div class="token-name">
-                    {filteredTokens.find((t) => t.tokenId === tokenId).name}
-                  </div>
-                {/if}
-              </div>
-            {/each}
+
+          <div class="tab-buttons">
+            <button
+              class:active={activeSetTab === "tokens"}
+              on:click={() => (activeSetTab = "tokens")}
+            >
+              Tokens
+            </button>
+            <button
+              class:active={activeSetTab === "collectors"}
+              on:click={() => (activeSetTab = "collectors")}
+            >
+              Collectors
+            </button>
           </div>
+
+          {#if activeSetTab === "tokens"}
+            <div class="token-grid">
+              {#each selectedSet.tokens as tokenId}
+                <div class="token-card">
+                  <div class="token-id">
+                    ID: <a
+                      href={getTokenUrl(tokenId)}
+                      target="_blank"
+                      class="token-link">{tokenId}</a
+                    >
+                  </div>
+                  {#if filteredTokens.find((t) => t.tokenId === tokenId)}
+                    <div class="token-name">
+                      {filteredTokens.find((t) => t.tokenId === tokenId).name}
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <div class="collectors-list">
+              <h4>
+                Collectors who completed this set ({getSetCollectors(
+                  selectedSet.tokens
+                ).size})
+              </h4>
+              {#each Array.from(getSetCollectors(selectedSet.tokens)) as collector}
+                <div class="collector-item">
+                  <a
+                    href={`https://tzkt.io/${collector}/balances`}
+                    target="_blank"
+                    class="collector-link"
+                  >
+                    {collector}
+                  </a>
+                </div>
+              {/each}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -1391,5 +1490,64 @@
     padding: 1rem;
     border-radius: 4px;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  }
+
+  .tab-buttons {
+    display: flex;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+
+  .tab-buttons button {
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: 4px;
+    background: #f0f0f0;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: all 0.2s;
+  }
+
+  .tab-buttons button.active {
+    background: #4bc0c0;
+    color: white;
+  }
+
+  .tab-buttons button:hover {
+    background: #e0e0e0;
+  }
+
+  .tab-buttons button.active:hover {
+    background: #3aa6a6;
+  }
+
+  .collectors-list {
+    margin-top: 1rem;
+    max-height: 400px;
+    overflow-y: auto;
+    background: white;
+    padding: 1rem;
+    border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  }
+
+  .collector-item {
+    padding: 0.5rem;
+    border-bottom: 1px solid #eee;
+  }
+
+  .collector-item:last-child {
+    border-bottom: none;
+  }
+
+  .collector-link {
+    color: #0066cc;
+    text-decoration: none;
+    font-family: monospace;
+    font-size: 0.9rem;
+  }
+
+  .collector-link:hover {
+    text-decoration: underline;
   }
 </style>
